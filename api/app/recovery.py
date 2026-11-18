@@ -23,7 +23,7 @@ import subprocess
 import threading
 import time
 
-from . import config, db, lsn, state
+from . import archive, config, db, lsn, state
 
 log = logging.getLogger("recovery")
 
@@ -163,10 +163,9 @@ def refresh_restore_points():
             needed = lsn.wal_files_between(start, lsn.parse(point["lsn"]))
         except ValueError:
             continue
-        missing = [
-            f for f in needed
-            if not os.path.exists(os.path.join(config.WAL_ARCHIVE_DIR, f))
-        ]
+        # A segment counts as archived in either format: a legacy plain file
+        # or a new verified .gz. Leftover *.partial-* files never count.
+        missing = [f for f in needed if not archive.segment_exists(f)]
         if missing:
             log.info(
                 "restore point %s: waiting for %d WAL file(s), e.g. %s",
@@ -225,12 +224,51 @@ def start_recovery(point_name):
         return state.one("SELECT * FROM recoveries WHERE id=?", (rec_id,))
 
 
+def _preflight_archive(target_lsn: str) -> list[str]:
+    """Fail explicitly, before postgres starts, on missing/corrupt archives.
+
+    Every segment between the base-backup end LSN and the target must exist as
+    a formal plain or gzip archive (partial temp files do not count), and each
+    gzip archive must pass an integrity test up front. The restore_command
+    still re-verifies while replaying; this just turns the two demanded
+    failure classes into direct, readable error messages on the recovery job.
+    """
+    backup_end = state.kv_get("backup_end_lsn")
+    if not backup_end:
+        raise RuntimeError("base backup end LSN is unknown; cannot verify WAL archive")
+    needed = lsn.wal_files_between(lsn.parse(backup_end), lsn.parse(target_lsn))
+    for seg in needed:
+        path = archive.archive_path(seg)
+        if path is None:
+            raise RuntimeError(
+                f"missing archived WAL segment {seg}: neither {seg} nor {seg}.gz "
+                f"exists in {config.WAL_ARCHIVE_DIR} (partial uploads do not count)"
+            )
+        if path.endswith(archive.GZIP_SUFFIX):
+            result = _run(["gzip", "-t", "--", path], timeout=120)
+            if result.returncode != 0:
+                raise RuntimeError(
+                    f"corrupt compressed WAL archive {seg}: 'gzip -t' failed: "
+                    f"{(result.stderr or result.stdout)[-500:]}"
+                )
+    return needed
+
+
 def _run_recovery(rec_id):
     rec = state.one("SELECT * FROM recoveries WHERE id=?", (rec_id,))
     work_dir = rec["work_dir"]
     data = _data_dir(work_dir)
     log_file = os.path.join(work_dir, "replica.log")
     try:
+        # 0. the WAL range must be complete up front, in either format; a
+        #    missing segment or corrupt gzip archive is a hard, explicit error.
+        segments = _preflight_archive(rec["target_lsn"])
+        log.info(
+            "recovery %s preflight OK: %d archived WAL segment(s): %s",
+            rec_id, len(segments),
+            ", ".join(f"{s}({archive.segment_format(s)})" for s in segments),
+        )
+
         # 1. fresh isolated copy of the physical base backup
         os.makedirs(data)
         result = _run(["cp", "-a", config.BACKUP_DIR + "/.", data], timeout=900)
@@ -238,7 +276,11 @@ def _run_recovery(rec_id):
             raise RuntimeError(f"copying base backup failed: {result.stderr[-1000:]}")
         os.chmod(data, 0o700)
 
-        # 2. PITR configuration: replay archived WAL up to the named point
+        # 2. PITR configuration: replay archived WAL up to the named point.
+        #    The restore command picks plain vs gzip per segment, so a restore
+        #    point spanning the format switch replays transparently.
+        if not os.path.isfile(config.RESTORE_SCRIPT):
+            raise RuntimeError(f"restore script not found: {config.RESTORE_SCRIPT}")
         with open(os.path.join(data, "postgresql.auto.conf"), "a") as fh:
             fh.write(
                 "\n# ---- recovery-api ----\n"
@@ -247,7 +289,8 @@ def _run_recovery(rec_id):
                 "unix_socket_directories = '/tmp'\n"
                 "archive_mode = off\n"
                 "hot_standby = on\n"
-                f"restore_command = 'cp {config.WAL_ARCHIVE_DIR}/%f %p'\n"
+                f"restore_command = 'bash {config.RESTORE_SCRIPT} "
+                f"{config.WAL_ARCHIVE_DIR} %f %p'\n"
                 f"recovery_target_name = '{rec['restore_point']}'\n"
                 "recovery_target_action = 'pause'\n"
             )

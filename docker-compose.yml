@@ -4,11 +4,16 @@ services:
   db:
     image: postgres:16-bookworm
     container_name: traffic-pitr-db
+    # The stock entrypoint runs as root and drops to postgres; use that root
+    # phase to make sure the shared archive volume is writable by postgres
+    # (a fresh named volume is otherwise root-owned and archival fails).
+    entrypoint: ["/db-bin/entrypoint-fixperms.sh"]
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
       POSTGRES_DB: traffic
       TZ: UTC
+      WAL_ARCHIVE_DIR: /wal_archive
     command:
       - postgres
       - -c
@@ -17,8 +22,11 @@ services:
       - wal_level=replica
       - -c
       - archive_mode=on
+      # New segments are archived as gzip (fully written + verified before
+      # the final file is published); format is switchable at runtime via
+      # PUT /archive/mode, which rewrites /wal_archive/.archive_mode.
       - -c
-      - archive_command=test ! -f /wal_archive/%f && cp %p /wal_archive/%f
+      - "archive_command=/db-bin/archive-dispatcher.sh %p %f"
       - -c
       - archive_timeout=10
       - -c
@@ -29,6 +37,7 @@ services:
       - pgdata:/var/lib/postgresql/data
       - wal_archive:/wal_archive
       - ./db/init:/docker-entrypoint-initdb.d:ro
+      - ./db/archive:/db-bin:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d traffic"]
       interval: 3s
@@ -50,6 +59,7 @@ services:
       PGPASSWORD: postgres
       PGDATABASE: traffic
       TZ: UTC
+      WAL_ARCHIVE_DIR: /wal_archive
       # replica postgres refuses to run as root; the api container runs as root
       # and drops to this user (via gosu) only for the replica postmaster.
       REPLICA_RUN_AS: postgres

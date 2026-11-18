@@ -22,7 +22,7 @@ from fastapi.responses import RedirectResponse
 from psycopg.rows import dict_row
 from pydantic import BaseModel, Field
 
-from . import backup, config, db, lsn, recovery, state
+from . import archive, backup, config, db, lsn, recovery, state
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s"
@@ -52,9 +52,15 @@ def _monitor_loop():
 
 @asynccontextmanager
 async def lifespan(_app):
+    os.makedirs(config.WAL_ARCHIVE_DIR, exist_ok=True)
     os.makedirs(config.RECOVERY_ROOT, exist_ok=True)
     os.makedirs(os.path.dirname(config.STATE_DB), exist_ok=True)
     state.init()
+    # The primary's archive_command dispatcher defaults to gzip; make the
+    # chosen default explicit on the shared volume so /archive/usage and the
+    # dispatcher always agree.
+    if not os.path.exists(archive.mode_file_path()):
+        archive.set_mode(archive.MODE_GZIP)
     recovery.cleanup_on_startup()
     # physical base backup is established at startup, in the background
     threading.Thread(target=backup.run_base_backup, daemon=True, name="base-backup").start()
@@ -65,14 +71,20 @@ async def lifespan(_app):
 
 app = FastAPI(
     title="Traffic PITR Recovery API",
-    version="1.0.0",
+    version="1.1.0",
     description=(
         "Physical point-in-time recovery for the traffic_minute_counts table. "
+        "New WAL segments are archived as gzip (fully written and verified "
+        "before the formal file is published; interrupted compressions leave "
+        "only *.partial-* temp files); legacy plain segments stay readable and "
+        "a restore point spanning the format switch replays per segment in "
+        "whichever format each one was archived. "
         "Flow: 1) POST /demo/generate to simulate collection, "
         "2) POST /restore-points to create a named restore point, "
         "3) POST /demo/delete to simulate the accidental deletion, "
         "4) POST /recoveries to rebuild an isolated read-only replica at the "
         "restore point, 5) GET /replica/traffic to fetch the lost rows. "
+        "GET /archive/usage reconciles per-format file counts and real bytes. "
         "The primary keeps collecting the whole time."
     ),
     lifespan=lifespan,
@@ -109,6 +121,46 @@ def backup_status():
         "error": state.kv_get("backup_error") or None,
         "backup_dir": config.BACKUP_DIR,
     }
+
+
+# --------------------------------------------------------------------------
+# WAL archive: gzip rollout, usage accounting
+# --------------------------------------------------------------------------
+
+@app.get("/archive/usage", tags=["archive"])
+def archive_usage():
+    """Archive volume usage split by segment format.
+
+    Formal WAL segments are counted as ``plain`` (legacy uncompressed) or
+    ``gzip`` (new compressed), each with file count, logical size and the
+    actually allocated bytes, so space savings from compression can be
+    reconciled directly. Interrupted compressions show up under
+    ``partial_files`` and are never counted as valid archives.
+    """
+    return archive.usage()
+
+
+class ArchiveModeRequest(BaseModel):
+    mode: str = Field(..., pattern="^(gzip|plain)$")
+
+
+@app.get("/archive/mode", tags=["archive"])
+def get_archive_mode():
+    """Format the primary's archive dispatcher currently writes in."""
+    return {"mode": archive.current_mode(), "mode_file": archive.mode_file_path()}
+
+
+@app.put("/archive/mode", tags=["archive"])
+def put_archive_mode(req: ArchiveModeRequest):
+    """Switch future WAL archival between gzip and plain.
+
+    Already archived segments are never touched, so a recovery point that
+    spans the switch is replayed per segment in whichever format each one was
+    archived in. The primary picks up the change on its next archive attempt.
+    """
+    archive.set_mode(req.mode)
+    log.info("WAL archive mode switched to %s", req.mode)
+    return {"mode": archive.current_mode()}
 
 
 # --------------------------------------------------------------------------
@@ -326,6 +378,7 @@ def demo_overview():
     return {
         "primary": {"total_rows": total, "per_intersection": per_ix},
         "backup": backup_status(),
+        "archive": archive.usage(),
         "restore_points": state.q("SELECT * FROM restore_points ORDER BY id"),
         "recoveries": state.q("SELECT * FROM recoveries ORDER BY id DESC"),
         "current_recovery_id": state.kv_get("current_recovery_id"),

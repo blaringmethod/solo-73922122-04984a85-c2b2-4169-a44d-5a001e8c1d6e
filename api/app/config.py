@@ -28,6 +28,11 @@ WAL_ARCHIVE_DIR = os.environ.get("WAL_ARCHIVE_DIR", "/wal_archive")
 BACKUP_DIR = os.environ.get("BACKUP_DIR", "/backups/base")
 RECOVERY_ROOT = os.environ.get("RECOVERY_ROOT", "/recovery_work")
 STATE_DB = os.environ.get("STATE_DB", "/state/api.db")
+# Shell script used as the replica restore_command; it serves each archived
+# WAL segment either by raw copy (legacy plain format) or streamed gunzip.
+RESTORE_SCRIPT = os.environ.get(
+    "RESTORE_SCRIPT", os.path.join(os.path.dirname(os.path.dirname(__file__)), "restore-wal.sh")
+)
 
 # --- recovery behaviour ------------------------------------------------------
 RECOVERY_TIMEOUT_SEC = int(os.environ.get("RECOVERY_TIMEOUT_SEC", "180"))

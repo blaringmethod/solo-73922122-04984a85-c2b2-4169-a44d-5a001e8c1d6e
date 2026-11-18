@@ -10,6 +10,8 @@ RUN python3 -m venv /opt/venv \
  && /opt/venv/bin/pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
+# restore_command helper: per-segment plain copy or streamed gunzip.
+RUN chmod 0755 /app/restore-wal.sh
 
 ENV PATH="/opt/venv/bin:$PATH" \
     PYTHONUNBUFFERED=1
